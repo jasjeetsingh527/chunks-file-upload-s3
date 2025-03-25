@@ -2,7 +2,7 @@ require("dotenv").config();
 const logger = require("morgan");
 const express = require("express");
 const cors = require("cors");
-const BUCKET_NAME = "bucket-name";
+const BUCKET_NAME = process.env.BUCKET_NAME;
 const PORT = 5000;
 const {
   S3Client,
@@ -21,7 +21,11 @@ app.use(
   )
 );
 const s3Client = new S3Client({
-  region: "us-east-1",
+  region: process.env.REGION || "us-east-1",
+  credentials: {
+    accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+  },
 });
 
 app.get("/", (req, res) => {

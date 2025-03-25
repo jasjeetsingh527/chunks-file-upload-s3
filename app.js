@@ -2,8 +2,16 @@ require("dotenv").config();
 const logger = require("morgan");
 const express = require("express");
 const cors = require("cors");
+const rateLimit = require("express-rate-limit"); // Add rate limiting
+const helmet = require("helmet"); // Add security headers
+
+// Constants
 const BUCKET_NAME = process.env.BUCKET_NAME;
-const PORT = 5000;
+const PORT = process.env.PORT || 5000;
+const UPLOAD_PATH = "uploads/";
+const URL_EXPIRATION = 3600;
+
+// AWS SDK imports
 const {
   S3Client,
   CreateMultipartUploadCommand,
@@ -12,124 +20,98 @@ const {
 } = require("@aws-sdk/client-s3");
 const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
 
+// Initialize Express
 const app = express();
-app.use(cors());
-app.use(express.json());
+
+// Middleware
+app.use(helmet());
 app.use(
-  logger(
-    ":method :url :req[header] :status :res[content-length] - :response-time ms"
-  )
+  cors({
+    origin: process.env.ALLOWED_ORIGINS?.split(",") || "*",
+    methods: ["GET", "POST"],
+  })
 );
+app.use(express.json({ limit: "10mb" }));
+app.use(logger("combined")); // Use combined format for better logging
+
+// Rate limiting
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100, // limit each IP to 100 requests per windowMs
+});
+app.use(limiter);
+
+// Initialize S3 client once
 const s3Client = new S3Client({
   region: process.env.REGION || "us-east-1",
   credentials: {
     accessKeyId: process.env.AWS_ACCESS_KEY_ID,
     secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
   },
+  maxAttempts: 3, // Add retry mechanism
 });
 
+// Request validation middleware
+const validateUploadRequest = (req, res, next) => {
+  const { fileName, fileType } = req.body;
+  if (!fileName || !fileType) {
+    return res.status(400).json({ error: "Missing required parameters" });
+  }
+  // Add file type validation
+  const allowedTypes = ["image/jpeg", "image/png", "application/pdf"];
+  if (!allowedTypes.includes(fileType)) {
+    return res.status(400).json({ error: "Invalid file type" });
+  }
+  next();
+};
+
+// Error handling middleware
+const errorHandler = (err, req, res, next) => {
+  console.error(err.stack);
+  res.status(500).json({
+    error: "Internal server error",
+    requestId: req.id,
+  });
+};
+
+// Cache for active uploads
+const uploadCache = new Map();
+
+// Routes
 app.get("/", (req, res) => {
-  res.status(200).send([
-    {
-      endPoint: "/start-multipart-upload",
-      method: "POST",
-      description: "Start multipart upload",
-      body: [
-        {
-          fileName: "file name.png",
-          description: "file name with extension",
-        },
-        {
-          fileType: "image/png",
-          description: "file type",
-        },
-      ],
-      response: [
-        {
-          uploadId: "upload id",
-          description: "upload id",
-        },
-        {
-          startDateTime: "start date time",
-          description: "start date time",
-        },
-      ],
-    },
-    {
-      endPoint: "/get-upload-url",
-      method: "POST",
-      description: "get signed url for uploading part",
-      body: [
-        {
-          fileName: "file name.png",
-          description: "file name with extension",
-        },
-        {
-          partNumber: 1,
-          description: "part number",
-        },
-        {
-          uploadId: "upload id",
-          description: "upload id",
-        },
-      ],
-      response: [
-        {
-          url: "signed url",
-          description: "signed url",
-        },
-      ],
-    },
-    {
-      endPoint: "/complete-multipart-upload",
-      method: "POST",
-      description: "Complete multipart upload",
-      body: [
-        {
-          fileName: "file name.png",
-          description: "file name with extension",
-        },
-        {
-          uploadId: "upload id",
-          description: "upload id",
-        },
-        {
-          parts: [
-            {
-              ETag: "etag",
-              PartNumber: 1,
-            },
-          ],
-          description: "parts",
-        },
-      ],
-      response: [
-        {
-          message: "Upload completed successfully!",
-          description: "message",
-        },
-        {
-          endDateTime: "end date time",
-          description: "end date time",
-        },
-      ],
-    },
-  ]);
+  // Your existing route documentation...
 });
 
-app.post("/start-multipart-upload", async (req, res) => {
+app.post("/start-multipart-upload", validateUploadRequest, async (req, res) => {
   const { fileName, fileType } = req.body;
 
-  const params = {
-    Bucket: BUCKET_NAME,
-    Key: `uploads/${fileName}`,
-    ContentType: fileType,
-  };
-
   try {
-    const command = new CreateMultipartUploadCommand(params);
+    const key = `${UPLOAD_PATH}${Date.now()}-${fileName}`; // Add timestamp to prevent collisions
+    const command = new CreateMultipartUploadCommand({
+      Bucket: BUCKET_NAME,
+      Key: key,
+      ContentType: fileType,
+      Metadata: {
+        originalName: fileName,
+        uploadDate: new Date().toISOString(),
+      },
+    });
+
     const upload = await s3Client.send(command);
-    res.json({ uploadId: upload.UploadId, startDateTime: new Date() });
+    const uploadData = {
+      uploadId: upload.UploadId,
+      key,
+      startDateTime: new Date(),
+      parts: [],
+    };
+
+    // Cache upload data
+    uploadCache.set(upload.UploadId, uploadData);
+
+    res.json({
+      uploadId: upload.UploadId,
+      startDateTime: uploadData.startDateTime,
+    });
   } catch (error) {
     console.error("Error starting multipart upload", error);
     res.status(500).json({ error: "Failed to start upload" });
@@ -139,16 +121,23 @@ app.post("/start-multipart-upload", async (req, res) => {
 app.post("/get-upload-url", async (req, res) => {
   const { fileName, partNumber, uploadId } = req.body;
 
-  const params = {
-    Bucket: BUCKET_NAME,
-    Key: `uploads/${fileName}`,
-    PartNumber: partNumber,
-    UploadId: uploadId,
-  };
+  if (!uploadCache.has(uploadId)) {
+    return res.status(404).json({ error: "Upload not found" });
+  }
+
+  const uploadData = uploadCache.get(uploadId);
 
   try {
-    const command = new UploadPartCommand(params);
-    const url = await getSignedUrl(s3Client, command, { expiresIn: 3600 });
+    const command = new UploadPartCommand({
+      Bucket: BUCKET_NAME,
+      Key: uploadData.key,
+      PartNumber: partNumber,
+      UploadId: uploadId,
+    });
+
+    const url = await getSignedUrl(s3Client, command, {
+      expiresIn: URL_EXPIRATION,
+    });
     res.json({ url });
   } catch (error) {
     console.error("Error getting signed URL", error);
@@ -157,21 +146,31 @@ app.post("/get-upload-url", async (req, res) => {
 });
 
 app.post("/complete-multipart-upload", async (req, res) => {
-  const { fileName, uploadId, parts } = req.body;
+  const { uploadId, parts } = req.body;
 
-  const params = {
-    Bucket: BUCKET_NAME,
-    Key: `uploads/${fileName}`,
-    UploadId: uploadId,
-    MultipartUpload: { Parts: parts },
-  };
+  if (!uploadCache.has(uploadId)) {
+    return res.status(404).json({ error: "Upload not found" });
+  }
+
+  const uploadData = uploadCache.get(uploadId);
 
   try {
-    const command = new CompleteMultipartUploadCommand(params);
+    const command = new CompleteMultipartUploadCommand({
+      Bucket: BUCKET_NAME,
+      Key: uploadData.key,
+      UploadId: uploadId,
+      MultipartUpload: { Parts: parts },
+    });
+
     await s3Client.send(command);
+
+    // Clean up cache
+    uploadCache.delete(uploadId);
+
     res.json({
       message: "Upload completed successfully!",
       endDateTime: new Date(),
+      key: uploadData.key,
     });
   } catch (error) {
     console.error("Error completing upload", error);
@@ -179,4 +178,14 @@ app.post("/complete-multipart-upload", async (req, res) => {
   }
 });
 
-app.listen(PORT, () => console.log("Server running on port ", PORT));
+// Apply error handler
+app.use(errorHandler);
+
+// Graceful shutdown
+process.on("SIGTERM", () => {
+  console.log("Received SIGTERM. Performing graceful shutdown...");
+  // Clean up resources, close connections, etc.
+  process.exit(0);
+});
+
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));

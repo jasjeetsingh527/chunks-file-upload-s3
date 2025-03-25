@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8" />
+    <title>S3 Multi Video Upload</title>
+    <style>
+        #drop-zone {
+            width: 100%;
+            height: 120px;
+            border: 2px dashed #ccc;
+            border-radius: 5px;
+            text-align: center;
+            line-height: 120px;
+            margin-bottom: 10px;
+            background: #f9f9f9;
+            color: #555;
+        }
+
+        #progress-container {
+            width: 100%;
+            background-color: #ddd;
+            margin-top: 20px;
+            height: 25px;
+            border-radius: 5px;
+            overflow: hidden;
+            position: relative;
+        }
+
+        #progress-bar {
+            width: 0%;
+            height: 100%;
+            background-color: #4caf50;
+            text-align: center;
+            color: white;
+            line-height: 25px;
+        }
+
+        #speed-display {
+            position: absolute;
+            right: 100px;
+            top: 0;
+            line-height: 25px;
+            font-size: 14px;
+            color: #000;
+        }
+
+        #elapsedSec-display {
+            position: absolute;
+            right: 10px;
+            top: 0;
+            line-height: 25px;
+            font-size: 14px;
+            color: #000;
+        }
+    </style>
+</head>
+
+<body>
+    <div id="drop-zone">Drag & Drop Videos Here or Use the Button</div>
+    <input type="file" id="videoInput" accept="video/*" multiple />
+    <button onclick="startUploads()">Start Upload</button>
+    <button onclick="togglePause()"><span id="pauseText">Pause</span></button>
+
+    <div id="progress-container">
+        <div id="progress-bar">0%</div>
+        <div id="speed-display">0 MB/s</div>
+        <div id="elapsedSec-display">0 s</div>
+    </div>
+
+    <script>
+        const CHUNK_SIZE = 50 * 1024 * 1024; // 10MB
+        const MAX_PARALLEL_UPLOADS = 6;
+        const MAX_RETRIES = 3;
+
+        let allParts = {};
+        let paused = false;
+        let queue = [];
+        let activeUploads = new Map();
+        let uploadedCount = 0;
+        let totalChunks = 0;
+
+        let uploadedBytes = 0;
+        let uploadStartTime = 0;
+        let speedInterval = null;
+
+        let startTime = 0;
+        let endTime = 0;
+
+        document.getElementById("drop-zone").addEventListener("dragover", (e) => {
+            e.preventDefault();
+            e.dataTransfer.dropEffect = "copy";
+        });
+
+        document.getElementById("drop-zone").addEventListener("drop", (e) => {
+            e.preventDefault();
+            const files = e.dataTransfer.files;
+            document.getElementById("videoInput").files = files;
+        });
+
+        async function startUploads() {
+            const files = document.getElementById("videoInput").files;
+            if (!files.length) return alert("Please select at least one file.");
+
+            for (const file of files) {
+                await processAndUpload(file);
+            }
+        }
+
+        function togglePause() {
+            paused = !paused;
+            document.getElementById("pauseText").textContent = paused ? "Resume" : "Pause";
+
+            if (!paused) {
+                queue.forEach(fn => fn());
+                queue = [];
+            }
+        }
+
+        async function processAndUpload(file) {
+            const fileName = `video-${Date.now()}-${file.name}`;
+            const chunks = splitIntoChunks(file);
+            totalChunks = chunks.length;
+            uploadedCount = 0;
+            uploadedBytes = 0;
+            uploadStartTime = Date.now();
+
+            startSpeedTracking();
+
+            allParts[fileName] = [];
+            startTime = Date.now();
+            try {
+                const startRes = await fetch("http://localhost:5000/start-multipart-upload", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ fileName, fileType: file.type }),
+                });
+                const { uploadId } = await startRes.json();
+
+                await uploadChunks(chunks, fileName, uploadId);
+
+                allParts[fileName].sort((a, b) => a.PartNumber - b.PartNumber);
+
+                await fetch("http://localhost:5000/complete-multipart-upload", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ fileName, uploadId, parts: allParts[fileName] }),
+                });
+
+                stopSpeedTracking();
+                updateProgress(100);
+                endTime = Date.now();
+                const timeTaken = `${((endTime - startTime) / 1000).toFixed(2)} seconds`
+
+                document.getElementById("speed-display").textContent = `Upload complete Time taken: ${timeTaken}`;
+                alert(`${file.name} upload complete! Time taken: ${timeTaken}`);
+            } catch (err) {
+                stopSpeedTracking();
+                console.error("Upload error:", err);
+                alert(`${file.name} upload failed.`);
+            }
+        }
+
+        function splitIntoChunks(blob) {
+            const chunks = [];
+            let start = 0;
+            while (start < blob.size) {
+                const end = Math.min(start + CHUNK_SIZE, blob.size);
+                chunks.push(blob.slice(start, end));
+                start = end;
+            }
+            return chunks;
+        }
+
+        async function uploadChunks(chunks, fileName, uploadId) {
+            let nextIndex = 0;
+            const uploadPromises = [];
+
+            const startNext = () => {
+                if (paused) {
+                    queue.push(startNext);
+                    return;
+                }
+
+                if (nextIndex >= chunks.length) return;
+
+                const currentIndex = nextIndex++;
+                const chunk = chunks[currentIndex];
+
+                const uploadPromise = uploadChunkWithRetry(chunk, currentIndex + 1, fileName, uploadId, 0)
+                    .then(() => {
+                        uploadedCount++;
+                        uploadedBytes += chunk.size;
+                        updateProgress((uploadedCount / chunks.length) * 100);
+                        activeUploads.delete(currentIndex);
+                        startNext(); // keep queue rolling
+                    })
+                    .catch(err => {
+                        console.error("Upload failed after retries:", err);
+                        throw err;
+                    });
+
+                activeUploads.set(currentIndex, uploadPromise);
+            };
+
+            for (let i = 0; i < Math.min(MAX_PARALLEL_UPLOADS, chunks.length); i++) {
+                startNext();
+            }
+
+            while (activeUploads.size > 0) {
+                await Promise.race([...activeUploads.values()]);
+            }
+        }
+
+        async function uploadChunkWithRetry(chunk, partNumber, fileName, uploadId, attempt) {
+            try {
+                const urlRes = await fetch("http://localhost:5000/get-upload-url", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ fileName, uploadId, partNumber }),
+                });
+
+                const { url } = await urlRes.json();
+
+                const res = await fetch(url, {
+                    method: "PUT",
+                    body: chunk,
+                });
+
+                if (!res.ok) throw new Error(`Chunk ${partNumber} failed`);
+
+                const eTag = res.headers.get("ETag");
+                allParts[fileName].push({ PartNumber: partNumber, ETag: eTag });
+            } catch (error) {
+                if (attempt < MAX_RETRIES) {
+                    console.warn(`Retrying chunk ${partNumber}, attempt ${attempt + 1}`);
+                    return uploadChunkWithRetry(chunk, partNumber, fileName, uploadId, attempt + 1);
+                } else {
+                    throw error;
+                }
+            }
+        }
+
+        function updateProgress(percent) {
+            const progressBar = document.getElementById("progress-bar");
+            progressBar.style.width = `${percent}%`;
+            progressBar.textContent = `${Math.round(percent)}%`;
+        }
+
+        function startSpeedTracking() {
+            speedInterval = setInterval(() => {
+                const elapsedSec = (Date.now() - uploadStartTime) / 1000;
+                const speed = uploadedBytes / elapsedSec / (1024 * 1024); // MB/s
+                document.getElementById("speed-display").textContent = `${speed.toFixed(2)} MB/s`;
+                document.getElementById("elapsedSec-display").textContent = `${elapsedSec} s`;
+            }, 1000);
+        }
+
+        function stopSpeedTracking() {
+            clearInterval(speedInterval);
+            speedInterval = null;
+        }
+    </script>
+</body>
+
+</html>
